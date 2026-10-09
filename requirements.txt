@@ -3,4 +3,3 @@ uvicorn
 requests
 pydantic
 supabase
-gotrue==1.3.1
