@@ -121,7 +121,9 @@ def initiate_stk_push(payload: UnifiedVoucherPurchaseRequest):
     and sends an active STK payment screen prompt directly to the user's phone.
     """
     tier_data = supabase.table("voucher_tiers").select("*").eq("id", payload.tier_id).execute()
-    if not tier_data.data:
+    
+    # CRITICAL EXTRACTOR PATCH: Step directly into data list block row 0
+    if not tier_data.data or len(tier_data.data) == 0:
         raise HTTPException(status_code=404, detail="Invalid target tier selected.")
     
     cost = float(tier_data.data[0]["cost_kes"])
@@ -156,7 +158,7 @@ async def mpesa_payment_callback(request: Request, background_tasks: BackgroundT
     
     if status == "SUCCESS":
         txn_query = supabase.table("wallet_transactions").select("*").eq("mpesa_checkout_id", checkout_id).execute()
-        if not txn_query.data:
+        if not txn_query.data or len(txn_query.data) == 0:
             return {"status": "error", "message": "Reference not found."}
         txn = txn_query.data[0]
             
@@ -168,7 +170,7 @@ async def mpesa_payment_callback(request: Request, background_tasks: BackgroundT
         
         tier_id = txn_type.replace("voucher_", "")
         tier_query = supabase.table("voucher_tiers").select("*").eq("id", tier_id).execute()
-        if not tier_query.data:
+        if not tier_query.data or len(tier_query.data) == 0:
             return {"status": "error", "message": "Tier specifications not found."}
         tier = tier_query.data[0]
         
@@ -184,9 +186,10 @@ async def mpesa_payment_callback(request: Request, background_tasks: BackgroundT
             
         if tier["voice_minutes_allocated"] > 0:
             user_profile_query = supabase.table("users").select("premium_voice_minutes").eq("id", user_id).execute()
-            user_profile = user_profile_query.data[0]
-            updated_minutes = user_profile["premium_voice_minutes"] + tier["voice_minutes_allocated"]
-            supabase.table("users").update({"premium_voice_minutes": updated_minutes}).eq("id", user_id).execute()
+            if user_profile_query.data and len(user_profile_query.data) > 0:
+                user_profile = user_profile_query.data[0]
+                updated_minutes = user_profile["premium_voice_minutes"] + tier["voice_minutes_allocated"]
+                supabase.table("users").update({"premium_voice_minutes": updated_minutes}).eq("id", user_id).execute()
             
         supabase.table("wallet_transactions").update({"status": "SUCCESS"}).eq("mpesa_checkout_id", checkout_id).execute()
         return {"status": "processed", "message": "KYC verified and allowances allocated."}
@@ -203,7 +206,7 @@ def verify_and_route_call(payload: CallRouteCheckRequest):
     Validates limits and returns a strict session cutoff time down to the second.
     """
     user_query = supabase.table("users").select("*").eq("assigned_voip_number", payload.virtual_number).execute()
-    if not user_query.data:
+    if not user_query.data or len(user_query.data) == 0:
         return {"action": "reject", "reason": "Virtual target layout structurally unassigned"}
         
     user = user_query.data[0]
@@ -228,8 +231,3 @@ def process_voip_session_termination(payload: CallStatusUpdateRequest):
     Listens for session completions from your telecom providers to deduct used talk time.
     """
     if payload.event == "Hangup":
-        session_query = supabase.table("call_sessions").select("*").eq("session_id", payload.session_id).execute()
-        if session_query.data:
-            session = session_query.data[0]
-            user_id = session["user_id"]
-            minutes_spent = max(1, int(payload.duration_seconds / 60))
