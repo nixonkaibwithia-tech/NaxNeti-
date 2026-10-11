@@ -168,6 +168,8 @@ async def mpesa_payment_callback(request: Request, background_tasks: BackgroundT
         
         tier_id = txn_type.replace("voucher_", "")
         tier_query = supabase.table("voucher_tiers").select("*").eq("id", tier_id).execute()
+        if not tier_query.data:
+            return {"status": "error", "message": "Tier specifications not found."}
         tier = tier_query.data[0]
         
         supabase.table("users").update({
@@ -231,4 +233,3 @@ def process_voip_session_termination(payload: CallStatusUpdateRequest):
             session = session_query.data[0]
             user_id = session["user_id"]
             minutes_spent = max(1, int(payload.duration_seconds / 60))
-            
