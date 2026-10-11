@@ -122,7 +122,6 @@ def initiate_stk_push(payload: UnifiedVoucherPurchaseRequest):
     """
     tier_data = supabase.table("voucher_tiers").select("*").eq("id", payload.tier_id).execute()
     
-    # CRITICAL EXTRACTOR PATCH: Step directly into data list block row 0
     if not tier_data.data or len(tier_data.data) == 0:
         raise HTTPException(status_code=404, detail="Invalid target tier selected.")
     
