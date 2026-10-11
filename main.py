@@ -3,19 +3,22 @@ import requests
 import base64
 from datetime import datetime, timedelta
 from decimal import Decimal
-from typing import Optional
-from fastapi import FastAPI, HTTPException, Request, BackgroundTasks
+from typing import Optional, Dict, Any
+from fastapi import FastAPI, HTTPException, Request, BackgroundTasks, Header
 from pydantic import BaseModel
 from supabase import create_client, Client
 
-app = FastAPI(title="NaxNeti Telecom Core Backend", version="2.0.0")
+app = FastAPI(title="NaxNeti Telecom Core Backend", version="2.0.1")
 
 # -------------------------------------------------------------
-# CLOUD DB & ECOSYSTEM CONNECTION INITIALIZATION
+# CLOUD DB & SECURITY INTERFACE CONNECTION INITIALIZATION
 # -------------------------------------------------------------
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
+
+# Infrastructure Verification Token Moat
+NAXNETI_API_SECRET = os.getenv("NAXNETI_API_SECRET", "UX_Umoja_Node_Secure_99")
 
 # MikroTik Gateway Credentials (Ground Infrastructure Access)
 MIKROTIK_IP = os.getenv("MIKROTIK_ROUTER_IP")
@@ -65,6 +68,7 @@ class ClassifiedAdPostRequest(BaseModel):
     description: str
     price_kes: Optional[float] = 0.0
     pay_to_pin: bool = False
+    mpesa_checkout_id: Optional[str] = None # Tied directly to payment records for verification
 
 # -------------------------------------------------------------
 # BACKGROUND HARDWARE SYNC BRIDGE (MIKROTIK INFRASTRUCTURE LOOP)
@@ -115,17 +119,23 @@ def get_mpesa_access_token():
         return "MOCK_TOKEN"
 
 @app.post("/api/v1/payments/stkpush")
-def initiate_stk_push(payload: UnifiedVoucherPurchaseRequest):
+def initiate_stk_push(payload: UnifiedVoucherPurchaseRequest, x_api_key: Optional[str] = Header(None)):
     """
-    Fetches exact package pricing parameters from public.voucher_tiers 
+    Fetches package parameters from public.voucher_tiers, records transactions, 
     and sends an active STK payment screen prompt directly to the user's phone.
     """
+    # Enforce API Secret Verification to protect your monetization pipelines
+    if x_api_key != NAXNETI_API_SECRET:
+        raise HTTPException(status_code=401, detail="Unauthorized NaxNeti API Handshake Access Denied.")
+
     tier_data = supabase.table("voucher_tiers").select("*").eq("id", payload.tier_id).execute()
     
+    # Secure extraction check out of response list arrays
     if not tier_data.data or len(tier_data.data) == 0:
         raise HTTPException(status_code=404, detail="Invalid target tier selected.")
     
-    cost = float(tier_data.data[0]["cost_kes"])
+    selected_tier = tier_data.data[0]
+    cost = float(selected_tier["cost_kes"])
     access_token = get_mpesa_access_token()
     checkout_id = f"NXT_CHKT_{int(datetime.utcnow().timestamp())}"
     
@@ -148,17 +158,23 @@ def initiate_stk_push(payload: UnifiedVoucherPurchaseRequest):
 @app.post("/api/v1/payments/callback")
 async def mpesa_payment_callback(request: Request, background_tasks: BackgroundTasks):
     """
-    Processes transaction responses from network webhooks. If successful, it performs 
-    on-site KYC phone binding, updates network data allocations, and tells the router to unblock the user.
+    Processes transaction responses from standard Safaricom Daraja JSON blocks.
+    Binds the subscriber to the phone number and unblocks local network access.
     """
     body = await request.json()
-    checkout_id = body.get("checkout_id")
-    status = body.get("status", "SUCCESS") 
     
-    if status == "SUCCESS":
+    # DEEP REWRITE: Parses nested Safaricom STK payload signatures accurately
+    stk_callback = body.get("Body", {}).get("stkCallback", {})
+    if not stk_callback:
+        return {"status": "error", "message": "Invalid Safaricom payload configuration."}
+        
+    checkout_id = stk_callback.get("MerchantRequestID") or stk_callback.get("CheckoutRequestID")
+    result_code = stk_callback.get("ResultCode")
+    
+    if result_code == 0:  # Code 0 strictly indicates Safaricom Transaction Success
         txn_query = supabase.table("wallet_transactions").select("*").eq("mpesa_checkout_id", checkout_id).execute()
         if not txn_query.data or len(txn_query.data) == 0:
-            return {"status": "error", "message": "Reference not found."}
+            return {"status": "error", "message": "Transaction tracking token not found."}
         txn = txn_query.data[0]
             
         user_id = txn["user_id"]
@@ -170,14 +186,16 @@ async def mpesa_payment_callback(request: Request, background_tasks: BackgroundT
         tier_id = txn_type.replace("voucher_", "")
         tier_query = supabase.table("voucher_tiers").select("*").eq("id", tier_id).execute()
         if not tier_query.data or len(tier_query.data) == 0:
-            return {"status": "error", "message": "Tier specifications not found."}
+            return {"status": "error", "message": "Voucher settings match entry not found."}
         tier = tier_query.data[0]
         
+        # Regulatory Subscriber KYC Phone Binding
         supabase.table("users").update({
             "phone_number": verified_phone,
             "device_mac_address": mac_address
         }).eq("id", user_id).execute()
         
+        # Calculate and update network access profiles
         if tier["wifi_duration_hours"] > 0:
             new_expiry = datetime.utcnow() + timedelta(hours=tier["wifi_duration_hours"])
             supabase.table("users").update({"wifi_expiration_time": new_expiry.isoformat()}).eq("id", user_id).execute()
@@ -193,40 +211,18 @@ async def mpesa_payment_callback(request: Request, background_tasks: BackgroundT
         supabase.table("wallet_transactions").update({"status": "SUCCESS"}).eq("mpesa_checkout_id", checkout_id).execute()
         return {"status": "processed", "message": "KYC verified and allowances allocated."}
         
-    return {"status": "ignored"}
+    return {"status": "ignored", "code": result_code}
 
 # -------------------------------------------------------------
 # MODULE 2: REAL-TIME TELECOM VOIP CONTROLLER WITH HARD CUTOFFS
 # -------------------------------------------------------------
 @app.post("/api/v1/voip/route-check")
-def verify_and_route_call(payload: CallRouteCheckRequest):
+def verify_and_route_call(payload: CallRouteCheckRequest, x_api_key: Optional[str] = Header(None)):
     """
-    Fires instantly when an incoming call hits your virtual numbers via Africa's Talking.
-    Validates limits and returns a strict session cutoff time down to the second.
+    Validates user talk-time balance parameters instantly on incoming calls 
+    and returns a strict duration cutoff value down to the second.
     """
-    user_query = supabase.table("users").select("*").eq("assigned_voip_number", payload.virtual_number).execute()
-    if not user_query.data or len(user_query.data) == 0:
-        return {"action": "reject", "reason": "Virtual target layout structurally unassigned"}
-        
-    user = user_query.data[0]
-    
-    if user["subscription_active"]:
-        return {"action": "accept", "max_duration_seconds": 3600, "billing": "flat_rate"}
-        
-    if user["premium_voice_minutes"] > 0:
-        allowed_seconds = user["premium_voice_minutes"] * 60
-        supabase.table("call_sessions").insert({
-            "user_id": user["id"], "session_id": payload.session_id,
-            "caller_number": payload.caller_number, "destination_number": payload.virtual_number,
-            "start_time": datetime.utcnow().isoformat()
-        }).execute()
-        return {"action": "accept", "max_duration_seconds": allowed_seconds, "billing": "tier_voice"}
-        
-    return {"action": "reject", "reason": "Zero talk-time balances remain on account."}
+    if x_api_key != NAXNETI_API_SECRET:
+        raise HTTPException(status_code=401, detail="Unauthorized voice bridge link blocked.")
 
-@app.post("/api/v1/voip/call-status-webhook")
-def process_voip_session_termination(payload: CallStatusUpdateRequest):
-    """
-    Listens for session completions from your telecom providers to deduct used talk time.
-    """
-    if payload.event == "Hangup":
+    user_query = supabase.table("users").select("*").eq("assigned_voip_number", payload.virtual_number).execute()
