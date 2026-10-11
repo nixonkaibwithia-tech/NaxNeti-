@@ -32,9 +32,9 @@ MPESA_PASSKEY = os.getenv("MPESA_PASSKEY")
 # VALIDATION MODELS
 # -------------------------------------------------------------
 class UnifiedVoucherPurchaseRequest(BaseModel):
-    phone_number: str       # e.g., +254712345678
-    tier_id: str            # SOKO_BASIC, KAZI_DIGITAL, BIASHARA_PREMIUM, UMOJA_ON_AIR
-    device_mac_address: str # Bounded dynamically during purchase for hardware KYC integration
+    phone_number: str       
+    tier_id: str            
+    device_mac_address: str 
     user_id: str
 
 class CallRouteCheckRequest(BaseModel):
@@ -44,7 +44,7 @@ class CallRouteCheckRequest(BaseModel):
 
 class CallStatusUpdateRequest(BaseModel):
     session_id: str
-    event: str              # 'Answer', 'Hangup'
+    event: str              
     duration_seconds: Optional[int] = 0
 
 class ChamaCreateRequest(BaseModel):
@@ -74,11 +74,10 @@ def trigger_mikrotik_access_bridge(mac_address: str, duration_hours: int):
     Background Task: Dispatches an execution routing command to the physical MikroTik 
     Gateway Router deployed on-site at the Umoja 1 Market area.
     """
-    if not MIKROTIK_IP:
+    if not MIKROTIK_IP or MIKROTIK_IP == "0.0.0.0":
         print(f"[MOCK HARDWARE BRIDGE]: Router IP offline. Device MAC {mac_address} granted access for {duration_hours}H.")
         return
 
-    # Communicates directly with the native router API port to update IP Hotspot parameters
     router_url = f"https://{MIKROTIK_IP}/api/v1/user-manager/user"
     payload = {
         "username": mac_address,
@@ -127,10 +126,8 @@ def initiate_stk_push(payload: UnifiedVoucherPurchaseRequest):
     
     cost = float(tier_data.data[0]["cost_kes"])
     access_token = get_mpesa_access_token()
-    
     checkout_id = f"NXT_CHKT_{int(datetime.utcnow().timestamp())}"
     
-    # Store billing data as pending transaction and lock KYC device parameters
     supabase.table("wallet_transactions").insert({
         "user_id": payload.user_id,
         "mpesa_checkout_id": checkout_id,
@@ -140,14 +137,12 @@ def initiate_stk_push(payload: UnifiedVoucherPurchaseRequest):
         "metadata": {"mac_address": payload.device_mac_address, "phone": payload.phone_number}
     }).execute()
     
-    if access_token == "MOCK_TOKEN":
-        return {
-            "status": "success", 
-            "message": "[DEVELOPMENT MOCK]: STK Push processing launched.", 
-            "checkout_id": checkout_id
-        }
-        
-    return {"status": "success", "message": "Lipa Na M-Pesa STK Prompt sent.", "checkout_id": checkout_id}
+    return {
+        "status": "success", 
+        "message": "STK Push transaction processing launched successfully.", 
+        "checkout_id": checkout_id,
+        "mode": "SANDBOX" if access_token == "MOCK_TOKEN" else "PRODUCTION"
+    }
 
 @app.post("/api/v1/payments/callback")
 async def mpesa_payment_callback(request: Request, background_tasks: BackgroundTasks):
@@ -174,17 +169,14 @@ async def mpesa_payment_callback(request: Request, background_tasks: BackgroundT
         tier_query = supabase.table("voucher_tiers").select("*").eq("id", tier_id).execute()
         tier = tier_query.data[0]
         
-        # Mandatory Regulatory Subscriber KYC Binding Execution
         supabase.table("users").update({
             "phone_number": verified_phone,
             "device_mac_address": mac_address
         }).eq("id", user_id).execute()
         
-        # Compute and allocate voucher allowances
         if tier["wifi_duration_hours"] > 0:
             new_expiry = datetime.utcnow() + timedelta(hours=tier["wifi_duration_hours"])
             supabase.table("users").update({"wifi_expiration_time": new_expiry.isoformat()}).eq("id", user_id).execute()
-            # Unblock internet access via the hardware bridge
             background_tasks.add_task(trigger_mikrotik_access_bridge, mac_address, tier["wifi_duration_hours"])
             
         if tier["voice_minutes_allocated"] > 0:
@@ -230,3 +222,13 @@ def verify_and_route_call(payload: CallRouteCheckRequest):
 @app.post("/api/v1/voip/call-status-webhook")
 def process_voip_session_termination(payload: CallStatusUpdateRequest):
     """
+    Listens for session completions from your telecom providers to deduct used talk time.
+    """
+    if payload.event == "Hangup":
+        session_query = supabase.table("call_sessions").select("*").eq("session_id", payload.session_id).execute()
+        if session_query.data:
+            session = session_query.data[0]
+            user_id = session["user_id"]
+            minutes_spent = max(1, int(payload.duration_seconds / 60))
+            
+            user_profile_query = supabase.table("users").select("premium_voice_minutes").eq("id", user_id).execute()
