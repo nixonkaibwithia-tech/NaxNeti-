@@ -155,13 +155,14 @@ async def mpesa_payment_callback(request: Request, background_tasks: BackgroundT
     status = body.get("status", "SUCCESS") 
     
     if status == "SUCCESS":
-        txn = supabase.table("wallet_transactions").select("*").eq("mpesa_checkout_id", checkout_id).execute()
-        if not txn.data:
+        txn_query = supabase.table("wallet_transactions").select("*").eq("mpesa_checkout_id", checkout_id).execute()
+        if not txn_query.data:
             return {"status": "error", "message": "Reference not found."}
+        txn = txn_query.data[0]
             
-        user_id = txn.data[0]["user_id"]
-        txn_type = txn.data[0]["transaction_type"]
-        meta = txn.data[0]["metadata"]
+        user_id = txn["user_id"]
+        txn_type = txn["transaction_type"]
+        meta = txn["metadata"]
         mac_address = meta.get("mac_address")
         verified_phone = meta.get("phone")
         
@@ -231,4 +232,3 @@ def process_voip_session_termination(payload: CallStatusUpdateRequest):
             user_id = session["user_id"]
             minutes_spent = max(1, int(payload.duration_seconds / 60))
             
-            user_profile_query = supabase.table("users").select("premium_voice_minutes").eq("id", user_id).execute()
