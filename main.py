@@ -8,7 +8,7 @@ from fastapi import FastAPI, HTTPException, Request, BackgroundTasks, Header
 from pydantic import BaseModel
 from supabase import create_client, Client
 
-app = FastAPI(title="NaxNeti Telecom Core Backend", version="2.0.7")
+app = FastAPI(title="NaxNeti Telecom Core Backend", version="2.0.8")
 
 # -------------------------------------------------------------
 # CLOUD DB & SECURITY INTERFACE CONNECTION INITIALIZATION
@@ -132,7 +132,7 @@ def initiate_stk_push(payload: UnifiedVoucherPurchaseRequest, x_api_key: Optiona
     if not tier_data.data or len(tier_data.data) == 0:
         raise HTTPException(status_code=404, detail="Invalid target tier selected.")
     
-    # Secure extraction target: Access index zero row flat map data
+    # CRITICAL ARRAY EXTRACTOR PATCH: target row zero explicitly via [0] index braces
     selected_tier = tier_data.data[0]
     cost = float(selected_tier["cost_kes"])
     access_token = get_mpesa_access_token()
@@ -228,4 +228,3 @@ def verify_and_route_call(payload: CallRouteCheckRequest, x_api_key: Optional[st
     user = user_query.data[0]
     
     if user["subscription_active"]:
-        return {"action": "accept", "max_duration_seconds": 3600, "billing": "flat_rate"}
