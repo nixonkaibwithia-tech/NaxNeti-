@@ -3,12 +3,12 @@ import requests
 import base64
 from datetime import datetime, timedelta
 from decimal import Decimal
-from typing import Optional
+from typing import Optional, Dict, Any
 from fastapi import FastAPI, HTTPException, Request, BackgroundTasks, Header
 from pydantic import BaseModel
 from supabase import create_client, Client
 
-app = FastAPI(title="NaxNeti Telecom Core Backend", version="2.0.3")
+app = FastAPI(title="NaxNeti Telecom Core Backend", version="2.0.4")
 
 # -------------------------------------------------------------
 # CLOUD DB & SECURITY INTERFACE CONNECTION INITIALIZATION
@@ -132,7 +132,6 @@ def initiate_stk_push(payload: UnifiedVoucherPurchaseRequest, x_api_key: Optiona
     if not tier_data.data or len(tier_data.data) == 0:
         raise HTTPException(status_code=404, detail="Invalid target tier selected.")
     
-    # FIXED TARGET EXTRATION MATRIX: Step straight into index [0] of the dataset array
     selected_tier = tier_data.data[0]
     cost = float(selected_tier["cost_kes"])
     access_token = get_mpesa_access_token()
@@ -219,7 +218,7 @@ def verify_and_route_call(payload: CallRouteCheckRequest, x_api_key: Optional[st
     Validates limits and returns a strict session cutoff time down to the second.
     """
     if x_api_key != NAXNETI_API_SECRET:
-        raise HTTPException(status_code=404, detail="Unauthorized voice bridge link blocked.")
+        raise HTTPException(status_code=401, detail="Unauthorized voice bridge link blocked.")
 
     user_query = supabase.table("users").select("*").eq("assigned_voip_number", payload.virtual_number).execute()
     if not user_query.data or len(user_query.data) == 0:
@@ -228,3 +227,6 @@ def verify_and_route_call(payload: CallRouteCheckRequest, x_api_key: Optional[st
     user = user_query.data[0]
     
     if user["subscription_active"]:
+        return {"action": "accept", "max_duration_seconds": 3600, "billing": "flat_rate"}
+        
+    if user["premium_voice_minutes"] > 0:
