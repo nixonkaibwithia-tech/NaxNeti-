@@ -8,7 +8,7 @@ from fastapi import FastAPI, HTTPException, Request, BackgroundTasks, Header
 from pydantic import BaseModel
 from supabase import create_client, Client
 
-app = FastAPI(title="NaxNeti Telecom Core Backend", version="2.0.10")
+app = FastAPI(title="NaxNeti Telecom Core Backend", version="2.0.20")
 
 # -------------------------------------------------------------
 # CLOUD DB & SECURITY INTERFACE CONNECTION INITIALIZATION
@@ -132,7 +132,7 @@ def initiate_stk_push(payload: UnifiedVoucherPurchaseRequest, x_api_key: Optiona
     if not tier_data.data or len(tier_data.data) == 0:
         raise HTTPException(status_code=404, detail="Invalid target tier selected.")
     
-    # FIXED extraction check out of data list arrays via row zero index tag
+    # RESOLVED FIXED VALUE ARRAYS POINT ZERO MAPPINGS
     selected_tier = tier_data.data[0]
     cost = float(selected_tier["cost_kes"])
     access_token = get_mpesa_access_token()
@@ -157,8 +157,7 @@ def initiate_stk_push(payload: UnifiedVoucherPurchaseRequest, x_api_key: Optiona
 @app.post("/api/v1/payments/callback")
 async def mpesa_payment_callback(request: Request, background_tasks: BackgroundTasks):
     """
-    Processes transaction responses from network webhooks. If successful, it performs 
-    on-site KYC phone binding, updates network data allocations, and tells the router to unblock the user.
+    Processes transaction responses from standard nested Safaricom JSON parameters.
     """
     body = await request.json()
     
@@ -215,7 +214,6 @@ async def mpesa_payment_callback(request: Request, background_tasks: BackgroundT
 @app.post("/api/v1/voip/route-check")
 def verify_and_route_call(payload: CallRouteCheckRequest, x_api_key: Optional[str] = Header(None)):
     """
-    Fires instantly when an incoming call hits your virtual numbers via Africa's Talking.
     Validates limits and returns a strict session cutoff time down to the second.
     """
     if x_api_key != NAXNETI_API_SECRET:
@@ -228,3 +226,8 @@ def verify_and_route_call(payload: CallRouteCheckRequest, x_api_key: Optional[st
     user = user_query.data[0]
     
     if user["subscription_active"]:
+        return {"action": "accept", "max_duration_seconds": 3600, "billing": "flat_rate"}
+        
+    if user["premium_voice_minutes"] > 0:
+        allowed_seconds = int(user["premium_voice_minutes"] * 60)
+        supabase.table("call_sessions").insert({
