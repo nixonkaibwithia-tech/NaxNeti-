@@ -8,7 +8,7 @@ from fastapi import FastAPI, HTTPException, Request, BackgroundTasks, Header
 from pydantic import BaseModel
 from supabase import create_client, Client
 
-app = FastAPI(title="NaxNeti Telecom Core Backend", version="2.0.2")
+app = FastAPI(title="NaxNeti Telecom Core Backend", version="2.0.3")
 
 # -------------------------------------------------------------
 # CLOUD DB & SECURITY INTERFACE CONNECTION INITIALIZATION
@@ -18,7 +18,6 @@ SUPABASE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 # Infrastructure Verification Token Moat
-# Used for securely identifying authorized client communication links
 NAXNETI_API_SECRET = os.getenv("NAXNETI_API_SECRET", "UX_Umoja_Node_Secure_99")
 
 # MikroTik Gateway Credentials (Ground Infrastructure Access)
@@ -125,7 +124,6 @@ def initiate_stk_push(payload: UnifiedVoucherPurchaseRequest, x_api_key: Optiona
     Fetches exact package pricing parameters from public.voucher_tiers 
     and sends an active STK payment screen prompt directly to the user's phone.
     """
-    # Enforce API Secret Verification to protect your monetization pipelines
     if x_api_key != NAXNETI_API_SECRET:
         raise HTTPException(status_code=401, detail="Unauthorized NaxNeti API Handshake Access Denied.")
 
@@ -134,7 +132,7 @@ def initiate_stk_push(payload: UnifiedVoucherPurchaseRequest, x_api_key: Optiona
     if not tier_data.data or len(tier_data.data) == 0:
         raise HTTPException(status_code=404, detail="Invalid target tier selected.")
     
-    # CRITICAL ARRAY EXTRACTOR IMPLEMENTATION: Step directly inside record row zero [0]
+    # FIXED TARGET EXTRATION MATRIX: Step straight into index [0] of the dataset array
     selected_tier = tier_data.data[0]
     cost = float(selected_tier["cost_kes"])
     access_token = get_mpesa_access_token()
@@ -164,7 +162,6 @@ async def mpesa_payment_callback(request: Request, background_tasks: BackgroundT
     """
     body = await request.json()
     
-    # Parse nested Safaricom STK payload structures accurately
     stk_callback = body.get("Body", {}).get("stkCallback", {})
     if not stk_callback:
         return {"status": "error", "message": "Invalid Safaricom payload configuration."}
@@ -172,7 +169,7 @@ async def mpesa_payment_callback(request: Request, background_tasks: BackgroundT
     checkout_id = stk_callback.get("MerchantRequestID") or stk_callback.get("CheckoutRequestID")
     result_code = stk_callback.get("ResultCode")
     
-    if result_code == 0:  # Code 0 strictly indicates Safaricom Transaction Success
+    if result_code == 0:  
         txn_query = supabase.table("wallet_transactions").select("*").eq("mpesa_checkout_id", checkout_id).execute()
         if not txn_query.data or len(txn_query.data) == 0:
             return {"status": "error", "message": "Transaction tracking token not found."}
@@ -190,13 +187,11 @@ async def mpesa_payment_callback(request: Request, background_tasks: BackgroundT
             return {"status": "error", "message": "Voucher settings match entry not found."}
         tier = tier_query.data[0]
         
-        # Regulatory Subscriber KYC Phone Binding
         supabase.table("users").update({
             "phone_number": verified_phone,
             "device_mac_address": mac_address
         }).eq("id", user_id).execute()
         
-        # Calculate and update network access profiles
         if tier["wifi_duration_hours"] > 0:
             new_expiry = datetime.utcnow() + timedelta(hours=tier["wifi_duration_hours"])
             supabase.table("users").update({"wifi_expiration_time": new_expiry.isoformat()}).eq("id", user_id).execute()
@@ -226,3 +221,10 @@ def verify_and_route_call(payload: CallRouteCheckRequest, x_api_key: Optional[st
     if x_api_key != NAXNETI_API_SECRET:
         raise HTTPException(status_code=404, detail="Unauthorized voice bridge link blocked.")
 
+    user_query = supabase.table("users").select("*").eq("assigned_voip_number", payload.virtual_number).execute()
+    if not user_query.data or len(user_query.data) == 0:
+        return {"action": "reject", "reason": "Virtual target layout structurally unassigned"}
+        
+    user = user_query.data[0]
+    
+    if user["subscription_active"]:
