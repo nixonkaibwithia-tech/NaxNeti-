@@ -8,7 +8,7 @@ from fastapi import FastAPI, HTTPException, Request, BackgroundTasks, Header
 from pydantic import BaseModel
 from supabase import create_client, Client
 
-app = FastAPI(title="NaxNeti Telecom Core Backend", version="2.0.4")
+app = FastAPI(title="NaxNeti Telecom Core Backend", version="2.0.5")
 
 # -------------------------------------------------------------
 # CLOUD DB & SECURITY INTERFACE CONNECTION INITIALIZATION
