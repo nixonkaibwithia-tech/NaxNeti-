@@ -3,12 +3,12 @@ import requests
 import base64
 from datetime import datetime, timedelta
 from decimal import Decimal
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List
 from fastapi import FastAPI, HTTPException, Request, BackgroundTasks, Header
 from pydantic import BaseModel
 from supabase import create_client, Client
 
-app = FastAPI(title="NaxNeti Telecom Core Backend", version="2.0.20")
+app = FastAPI(title="NaxNeti Telecom Core Backend", version="2.1.0")
 
 # -------------------------------------------------------------
 # CLOUD DB & SECURITY INTERFACE CONNECTION INITIALIZATION
@@ -132,7 +132,7 @@ def initiate_stk_push(payload: UnifiedVoucherPurchaseRequest, x_api_key: Optiona
     if not tier_data.data or len(tier_data.data) == 0:
         raise HTTPException(status_code=404, detail="Invalid target tier selected.")
     
-    # RESOLVED FIXED VALUE ARRAYS POINT ZERO MAPPINGS
+    # Secure extraction out of raw nested PostgREST response list arrays via index 0 row clamping
     selected_tier = tier_data.data[0]
     cost = float(selected_tier["cost_kes"])
     access_token = get_mpesa_access_token()
@@ -158,6 +158,7 @@ def initiate_stk_push(payload: UnifiedVoucherPurchaseRequest, x_api_key: Optiona
 async def mpesa_payment_callback(request: Request, background_tasks: BackgroundTasks):
     """
     Processes transaction responses from standard nested Safaricom JSON parameters.
+    Extracts verification parameters directly out of dynamic payload list structures.
     """
     body = await request.json()
     
@@ -165,69 +166,68 @@ async def mpesa_payment_callback(request: Request, background_tasks: BackgroundT
     if not stk_callback:
         return {"status": "error", "message": "Invalid Safaricom payload configuration."}
         
-    checkout_id = stk_callback.get("MerchantRequestID") or stk_callback.get("CheckoutRequestID")
+    checkout_id = stk_callback.get("CheckoutRequestID")
     result_code = stk_callback.get("ResultCode")
     
     if result_code == 0:  
         txn_query = supabase.table("wallet_transactions").select("*").eq("mpesa_checkout_id", checkout_id).execute()
         if not txn_query.data or len(txn_query.data) == 0:
             return {"status": "error", "message": "Transaction tracking token not found."}
+        
+        # Flatten database array row layer to pull clean dictionary maps
         txn = txn_query.data[0]
             
         user_id = txn["user_id"]
         txn_type = txn["transaction_type"]
         meta = txn["metadata"]
         mac_address = meta.get("mac_address")
-        verified_phone = meta.get("phone")
+        
+        # Dynamic extraction scan loop through Safaricom nested metadata items list array
+        callback_metadata = stk_callback.get("CallbackMetadata", {}).get("Item", [])
+        mpesa_receipt = "SANDBOX_VALIDATED"
+        customer_phone = meta.get("phone")
+        
+        for item in callback_metadata:
+            if item.get("Name") == "MpesaReceiptNumber":
+                mpesa_receipt = str(item.get("Value"))
+            elif item.get("Name") == "PhoneNumber":
+                customer_phone = str(item.get("Value"))
         
         tier_id = txn_type.replace("voucher_", "")
         tier_query = supabase.table("voucher_tiers").select("*").eq("id", tier_id).execute()
         if not tier_query.data or len(tier_query.data) == 0:
             return {"status": "error", "message": "Voucher settings match entry not found."}
+            
+        # Flatten database tier array row layer to clean dictionary mapping references
         tier = tier_query.data[0]
         
+        # Update security kyc bindings on user profiles
         supabase.table("users").update({
-            "phone_number": verified_phone,
+            "phone_number": customer_phone,
             "device_mac_address": mac_address
         }).eq("id", user_id).execute()
         
-        if tier["wifi_duration_hours"] > 0:
-            new_expiry = datetime.utcnow() + timedelta(hours=tier["wifi_duration_hours"])
+        # Map out internet allocation windows safely
+        if int(tier["wifi_duration_hours"]) > 0:
+            new_expiry = datetime.utcnow() + timedelta(hours=int(tier["wifi_duration_hours"]))
             supabase.table("users").update({"wifi_expiration_time": new_expiry.isoformat()}).eq("id", user_id).execute()
-            background_tasks.add_task(trigger_mikrotik_access_bridge, mac_address, tier["wifi_duration_hours"])
+            background_tasks.add_task(trigger_mikrotik_access_bridge, mac_address, int(tier["wifi_duration_hours"]))
             
-        if tier["voice_minutes_allocated"] > 0:
+        # Map out premium voice minute buckets safely
+        if int(tier["voice_minutes_allocated"]) > 0:
             user_profile_query = supabase.table("users").select("premium_voice_minutes").eq("id", user_id).execute()
             if user_profile_query.data and len(user_profile_query.data) > 0:
                 user_profile = user_profile_query.data[0]
-                updated_minutes = user_profile["premium_voice_minutes"] + tier["voice_minutes_allocated"]
+                updated_minutes = int(user_profile["premium_voice_minutes"]) + int(tier["voice_minutes_allocated"])
                 supabase.table("users").update({"premium_voice_minutes": updated_minutes}).eq("id", user_id).execute()
             
-        supabase.table("wallet_transactions").update({"status": "SUCCESS"}).eq("mpesa_checkout_id", checkout_id).execute()
-        return {"status": "processed", "message": "KYC verified and allowances allocated."}
+        # Mark tracking rows inside the database transaction logs as successful
+        supabase.table("wallet_transactions").update({
+            "status": "SUCCESS",
+            "metadata": {"mac_address": mac_address, "phone": customer_phone, "receipt": mpesa_receipt}
+        }).eq("mpesa_checkout_id", checkout_id).execute()
+        
+        return {"status": "processed", "message": "KYC verified and allowances allocated successfully."}
         
     return {"status": "ignored", "code": result_code}
 
-# -------------------------------------------------------------
-# MODULE 2: REAL-TIME TELECOM VOIP CONTROLLER WITH HARD CUTOFFS
-# -------------------------------------------------------------
-@app.post("/api/v1/voip/route-check")
-def verify_and_route_call(payload: CallRouteCheckRequest, x_api_key: Optional[str] = Header(None)):
-    """
-    Validates limits and returns a strict session cutoff time down to the second.
-    """
-    if x_api_key != NAXNETI_API_SECRET:
-        raise HTTPException(status_code=401, detail="Unauthorized voice bridge link blocked.")
-
-    user_query = supabase.table("users").select("*").eq("assigned_voip_number", payload.virtual_number).execute()
-    if not user_query.data or len(user_query.data) == 0:
-        return {"action": "reject", "reason": "Virtual target layout structurally unassigned"}
-        
-    user = user_query.data[0]
-    
-    if user["subscription_active"]:
-        return {"action": "accept", "max_duration_seconds": 3600, "billing": "flat_rate"}
-        
-    if user["premium_voice_minutes"] > 0:
-        allowed_seconds = int(user["premium_voice_minutes"] * 60)
-        supabase.table("call_sessions").insert({
