@@ -3,12 +3,12 @@ import requests
 import base64
 from datetime import datetime, timedelta
 from decimal import Decimal
-from typing import Optional, Dict, Any
+from typing import Optional
 from fastapi import FastAPI, HTTPException, Request, BackgroundTasks, Header
 from pydantic import BaseModel
 from supabase import create_client, Client
 
-app = FastAPI(title="NaxNeti Telecom Core Backend", version="2.0.1")
+app = FastAPI(title="NaxNeti Telecom Core Backend", version="2.0.2")
 
 # -------------------------------------------------------------
 # CLOUD DB & SECURITY INTERFACE CONNECTION INITIALIZATION
@@ -18,6 +18,7 @@ SUPABASE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 # Infrastructure Verification Token Moat
+# Used for securely identifying authorized client communication links
 NAXNETI_API_SECRET = os.getenv("NAXNETI_API_SECRET", "UX_Umoja_Node_Secure_99")
 
 # MikroTik Gateway Credentials (Ground Infrastructure Access)
@@ -68,7 +69,7 @@ class ClassifiedAdPostRequest(BaseModel):
     description: str
     price_kes: Optional[float] = 0.0
     pay_to_pin: bool = False
-    mpesa_checkout_id: Optional[str] = None # Tied directly to payment records for verification
+    mpesa_checkout_id: Optional[str] = None 
 
 # -------------------------------------------------------------
 # BACKGROUND HARDWARE SYNC BRIDGE (MIKROTIK INFRASTRUCTURE LOOP)
@@ -121,7 +122,7 @@ def get_mpesa_access_token():
 @app.post("/api/v1/payments/stkpush")
 def initiate_stk_push(payload: UnifiedVoucherPurchaseRequest, x_api_key: Optional[str] = Header(None)):
     """
-    Fetches package parameters from public.voucher_tiers, records transactions, 
+    Fetches exact package pricing parameters from public.voucher_tiers 
     and sends an active STK payment screen prompt directly to the user's phone.
     """
     # Enforce API Secret Verification to protect your monetization pipelines
@@ -130,10 +131,10 @@ def initiate_stk_push(payload: UnifiedVoucherPurchaseRequest, x_api_key: Optiona
 
     tier_data = supabase.table("voucher_tiers").select("*").eq("id", payload.tier_id).execute()
     
-    # Secure extraction check out of response list arrays
     if not tier_data.data or len(tier_data.data) == 0:
         raise HTTPException(status_code=404, detail="Invalid target tier selected.")
     
+    # CRITICAL ARRAY EXTRACTOR IMPLEMENTATION: Step directly inside record row zero [0]
     selected_tier = tier_data.data[0]
     cost = float(selected_tier["cost_kes"])
     access_token = get_mpesa_access_token()
@@ -158,12 +159,12 @@ def initiate_stk_push(payload: UnifiedVoucherPurchaseRequest, x_api_key: Optiona
 @app.post("/api/v1/payments/callback")
 async def mpesa_payment_callback(request: Request, background_tasks: BackgroundTasks):
     """
-    Processes transaction responses from standard Safaricom Daraja JSON blocks.
-    Binds the subscriber to the phone number and unblocks local network access.
+    Processes transaction responses from network webhooks. If successful, it performs 
+    on-site KYC phone binding, updates network data allocations, and tells the router to unblock the user.
     """
     body = await request.json()
     
-    # DEEP REWRITE: Parses nested Safaricom STK payload signatures accurately
+    # Parse nested Safaricom STK payload structures accurately
     stk_callback = body.get("Body", {}).get("stkCallback", {})
     if not stk_callback:
         return {"status": "error", "message": "Invalid Safaricom payload configuration."}
@@ -219,10 +220,9 @@ async def mpesa_payment_callback(request: Request, background_tasks: BackgroundT
 @app.post("/api/v1/voip/route-check")
 def verify_and_route_call(payload: CallRouteCheckRequest, x_api_key: Optional[str] = Header(None)):
     """
-    Validates user talk-time balance parameters instantly on incoming calls 
-    and returns a strict duration cutoff value down to the second.
+    Fires instantly when an incoming call hits your virtual numbers via Africa's Talking.
+    Validates limits and returns a strict session cutoff time down to the second.
     """
     if x_api_key != NAXNETI_API_SECRET:
-        raise HTTPException(status_code=401, detail="Unauthorized voice bridge link blocked.")
+        raise HTTPException(status_code=404, detail="Unauthorized voice bridge link blocked.")
 
-    user_query = supabase.table("users").select("*").eq("assigned_voip_number", payload.virtual_number).execute()
