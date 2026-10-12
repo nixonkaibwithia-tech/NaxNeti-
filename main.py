@@ -129,6 +129,10 @@ def initiate_stk_push(payload: UnifiedVoucherPurchaseRequest, x_api_key: Optiona
 
     tier_data = supabase.table("voucher_tiers").select("*").eq("id", payload.tier_id).execute()
     
+    # Smart Fallback Check: If searching by "id" column yields nothing, try searching by "name" column
+    if not tier_data.data or len(tier_data.data) == 0:
+        tier_data = supabase.table("voucher_tiers").select("*").eq("name", payload.tier_id).execute()
+    
     if not tier_data.data or len(tier_data.data) == 0:
         raise HTTPException(status_code=404, detail="Invalid target tier selected.")
     
@@ -153,6 +157,7 @@ def initiate_stk_push(payload: UnifiedVoucherPurchaseRequest, x_api_key: Optiona
         "checkout_id": checkout_id,
         "mode": "SANDBOX" if access_token == "MOCK_TOKEN" else "PRODUCTION"
     }
+
 
 @app.post("/api/v1/payments/callback")
 async def mpesa_payment_callback(request: Request, background_tasks: BackgroundTasks):
