@@ -1,238 +1,254 @@
 import os
 import requests
-import base64
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
-from typing import Optional, Dict, Any, List
-from fastapi import FastAPI, HTTPException, Request, BackgroundTasks, Header
+from fastapi import FastAPI, HTTPException, Request
 from pydantic import BaseModel
 from supabase import create_client, Client
 
-app = FastAPI(title="NaxNeti Telecom Core Backend", version="2.1.0")
+app = FastAPI(title="NaxNeti Telecom Core Backend")
 
 # -------------------------------------------------------------
-# CLOUD DB & SECURITY INTERFACE CONNECTION INITIALIZATION
+# ENVIRONMENT & CLOUD CONNECTIONS
 # -------------------------------------------------------------
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
+SAUTIKIT_API_KEY = os.getenv("SAUTIKIT_API_KEY")
+SAUTIKIT_NUMBER = os.getenv("SAUTIKIT_NUMBER")
+SAUTIKIT_BASE = "https://sautikit.com"
+
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
-# Infrastructure Verification Token Moat
-NAXNETI_API_SECRET = os.getenv("NAXNETI_API_SECRET", "UX_Umoja_Node_Secure_99")
-
-# MikroTik Gateway Credentials (Ground Infrastructure Access)
-MIKROTIK_IP = os.getenv("MIKROTIK_ROUTER_IP")
-MIKROTIK_USER = os.getenv("MIKROTIK_USER")
-MIKROTIK_PASS = os.getenv("MIKROTIK_PASS")
-
-# Safaricom M-Pesa Daraja Credentials
-MPESA_CONSUMER_KEY = os.getenv("MPESA_CONSUMER_KEY")
-MPESA_CONSUMER_SECRET = os.getenv("MPESA_CONSUMER_SECRET")
-MPESA_SHORTCODE = os.getenv("MPESA_SHORTCODE", "174379")
-MPESA_PASSKEY = os.getenv("MPESA_PASSKEY")
-
 # -------------------------------------------------------------
-# VALIDATION MODELS
+# REQUEST MODELS
 # -------------------------------------------------------------
-class UnifiedVoucherPurchaseRequest(BaseModel):
-    phone_number: str       
-    tier_id: str            
-    device_mac_address: str 
-    user_id: str
-
-class CallRouteCheckRequest(BaseModel):
-    session_id: str
-    caller_number: str
-    virtual_number: str
-
-class CallStatusUpdateRequest(BaseModel):
-    session_id: str
-    event: str              
-    duration_seconds: Optional[int] = 0
-
-class ChamaCreateRequest(BaseModel):
-    creator_id: str
-    name: str
-    contribution_amount: float
-    rotation_interval_days: int
-
-class ChamaContributeRequest(BaseModel):
-    chama_id: str
-    user_id: str
+class STKPushRequest(BaseModel):
+    phone_number: str
     amount: float
-    rotation_index: int
+    user_id: str
 
-class ClassifiedAdPostRequest(BaseModel):
-    merchant_id: str
-    title: str
-    description: str
-    price_kes: Optional[float] = 0.0
-    pay_to_pin: bool = False
-    mpesa_checkout_id: Optional[str] = None 
+class WifiAuthRequest(BaseModel):
+    user_id: str
+    device_mac_address: str
+    duration_minutes: int
 
-# -------------------------------------------------------------
-# BACKGROUND HARDWARE SYNC BRIDGE (MIKROTIK INFRASTRUCTURE LOOP)
-# -------------------------------------------------------------
-def trigger_mikrotik_access_bridge(mac_address: str, duration_hours: int):
-    """
-    Background Task: Dispatches an execution routing command to the physical MikroTik 
-    Gateway Router deployed on-site at the Umoja 1 Market area.
-    """
-    if not MIKROTIK_IP or MIKROTIK_IP == "0.0.0.0":
-        print(f"[MOCK HARDWARE BRIDGE]: Router IP offline. Device MAC {mac_address} granted access for {duration_hours}H.")
-        return
-
-    router_url = f"https://{MIKROTIK_IP}/api/v1/user-manager/user"
-    payload = {
-        "username": mac_address,
-        "mac-address": mac_address,
-        "uptime-limit": f"{duration_hours}h",
-        "profile": "Umoja_Market_Premium_Access"
-    }
-    
-    try:
-        requests.post(
-            router_url, 
-            json=payload, 
-            auth=(MIKROTIK_USER, MIKROTIK_PASS), 
-            timeout=10, 
-            verify=False
-        )
-        print(f"[MIKROTIK INTERFACE EXECUTED]: MAC address {mac_address} unblocked on hardware node.")
-    except Exception as e:
-        print(f"[HARDWARE INTERFACE CRITICAL CRASH]: Failed to hit router bridge: {str(e)}")
+class WebRTCTokenRequest(BaseModel):
+    user_id: str
 
 # -------------------------------------------------------------
-# MODULE 1: SAFARICOM M-PESA DARAJA CORE STK-PUSH CONTROLLER
+# API GROUP A: M-PESA & LEDGER MANAGEMENT
 # -------------------------------------------------------------
-def get_mpesa_access_token():
-    if not MPESA_CONSUMER_KEY or not MPESA_CONSUMER_SECRET:
-        return "MOCK_TOKEN"
-    url = "https://safaricom.co.ke"
-    credentials = f"{MPESA_CONSUMER_KEY}:{MPESA_CONSUMER_SECRET}"
-    encoded_credentials = base64.b64encode(credentials.encode()).decode()
-    headers = {"Authorization": f"Basic {encoded_credentials}"}
-    try:
-        res = requests.get(url, headers=headers, timeout=5)
-        return res.json().get("access_token")
-    except Exception:
-        return "MOCK_TOKEN"
-
 @app.post("/api/v1/payments/stkpush")
-def initiate_stk_push(payload: UnifiedVoucherPurchaseRequest, x_api_key: Optional[str] = Header(None)):
-    """
-    Fetches exact package pricing parameters from public.voucher_tiers 
-    and sends an active STK payment screen prompt directly to the user's phone.
-    """
-    if x_api_key != NAXNETI_API_SECRET:
-        raise HTTPException(status_code=401, detail="Unauthorized NaxNeti API Handshake Access Denied.")
-
-    tier_data = supabase.table("voucher_tiers").select("*").eq("id", payload.tier_id).execute()
-    
-    # Smart Fallback Check: If searching by "id" column yields nothing, try searching by "name" column
-    if not tier_data.data or len(tier_data.data) == 0:
-        tier_data = supabase.table("voucher_tiers").select("*").eq("name", payload.tier_id).execute()
-    
-    if not tier_data.data or len(tier_data.data) == 0:
-        raise HTTPException(status_code=404, detail="Invalid target tier selected.")
-    
-    # Secure extraction out of raw nested PostgREST response list arrays via index 0 row clamping
-    selected_tier = tier_data.data[0]
-    cost = float(selected_tier["cost_kes"])
-    access_token = get_mpesa_access_token()
-    checkout_id = f"NXT_CHKT_{int(datetime.utcnow().timestamp())}"
-    
-    supabase.table("wallet_transactions").insert({
-        "user_id": payload.user_id,
-        "mpesa_checkout_id": checkout_id,
-        "amount": cost,
-        "transaction_type": f"voucher_{payload.tier_id}",
-        "status": "PENDING",
-        "metadata": {"mac_address": payload.device_mac_address, "phone": payload.phone_number}
-    }).execute()
-    
-    return {
-        "status": "success", 
-        "message": "STK Push transaction processing launched successfully.", 
-        "checkout_id": checkout_id,
-        "mode": "SANDBOX" if access_token == "MOCK_TOKEN" else "PRODUCTION"
-    }
-
+def initiate_mpesa_push(payload: STKPushRequest):
+    try:
+        checkout_id = f"MPESA_CHKT_{int(datetime.now(timezone.utc).timestamp())}"
+        supabase.table("wallet_transactions").insert({
+            "user_id": payload.user_id,
+            "mpesa_checkout_id": checkout_id,
+            "amount": payload.amount,
+            "transaction_type": "top-up"
+        }).execute()
+        return {"status": "success", "message": "STK Push initialized", "checkout_id": checkout_id}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/api/v1/payments/callback")
-async def mpesa_payment_callback(request: Request, background_tasks: BackgroundTasks):
+async def mpesa_callback(request: Request):
+    data = await request.json()
+    checkout_id = data.get("checkout_id")
+    status = data.get("status")
+
+    if status == "SUCCESS":
+        txn_res = supabase.table("wallet_transactions").select("*").eq("mpesa_checkout_id", checkout_id).execute()
+        if not txn_res.data:
+            raise HTTPException(status_code=404, detail="Transaction reference not found")
+
+        txn = txn_res.data[0]
+        user_id = txn["user_id"]
+        topup_amount = Decimal(str(txn["amount"]))
+
+        user_res = supabase.table("users").select("wallet_balance").eq("id", user_id).execute()
+        if not user_res.data:
+            raise HTTPException(status_code=404, detail="User not found")
+
+        current_balance = Decimal(str(user_res.data[0]["wallet_balance"]))
+        new_balance = current_balance + topup_amount
+        supabase.table("users").update({"wallet_balance": float(new_balance)}).eq("id", user_id).execute()
+        return {"status": "processed", "message": "Wallet credited successfully"}
+
+    return {"status": "ignored", "message": "Transaction failed or incomplete"}
+
+# -------------------------------------------------------------
+# API GROUP B: SAUTIKIT VOICE, 4-DIGIT EXTENSION IVR & WEBRTC
+# -------------------------------------------------------------
+@app.post("/api/v1/voip/webrtc-token")
+def mint_sautikit_webrtc_token(payload: WebRTCTokenRequest):
     """
-    Processes transaction responses from standard nested Safaricom JSON parameters.
-    Extracts verification parameters directly out of dynamic payload list structures.
+    Mints a short-lived WebRTC session token from SautiKit for an authenticated NaxNeti user.
+    """
+    if not SAUTIKIT_API_KEY:
+        raise HTTPException(status_code=503, detail="SautiKit API key not configured")
+
+    user_res = supabase.table("users").select("*").eq("id", payload.user_id).execute()
+    if not user_res.data:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    user = user_res.data[0]
+    if not user["subscription_active"] and Decimal(str(user["wallet_balance"])) < Decimal("5.00"):
+        raise HTTPException(status_code=402, detail="Insufficient KES wallet balance to start voice session")
+
+    try:
+        resp = requests.post(
+            f"{SAUTIKIT_BASE}/v1/webrtc/token",
+            headers={
+                "Authorization": f"Bearer {SAUTIKIT_API_KEY}",
+                "Content-Type": "application/json"
+            },
+            json={
+                "client_name": f"naxneti-{user['id']}",
+                "role": "agent",
+                "phone_number": SAUTIKIT_NUMBER
+            },
+            timeout=10
+        )
+        if not resp.ok:
+            raise HTTPException(status_code=resp.status_code, detail=resp.text)
+        return resp.json()
+    except requests.RequestException as e:
+        raise HTTPException(status_code=502, detail=f"SautiKit connection failed: {str(e)}")
+
+
+@app.post("/api/v1/voip/voice-callback")
+async def sautikit_voice_callback(request: Request):
+    """
+    Shared-number voice webhook:
+    1. Prompts callers for a 4-digit extension.
+    2. Looks up the pilot user by extension, checks balance/subscription, and bridges the call.
+    3. Logs call duration, recording URL, and deducts KES on completion.
     """
     body = await request.json()
-    
-    stk_callback = body.get("Body", {}).get("stkCallback", {})
-    if not stk_callback:
-        return {"status": "error", "message": "Invalid Safaricom payload configuration."}
-        
-    checkout_id = stk_callback.get("CheckoutRequestID")
-    result_code = stk_callback.get("ResultCode")
-    
-    if result_code == 0:  
-        txn_query = supabase.table("wallet_transactions").select("*").eq("mpesa_checkout_id", checkout_id).execute()
-        if not txn_query.data or len(txn_query.data) == 0:
-            return {"status": "error", "message": "Transaction tracking token not found."}
-        
-        # Flatten database array row layer to pull clean dictionary maps
-        txn = txn_query.data[0]
-            
-        user_id = txn["user_id"]
-        txn_type = txn["transaction_type"]
-        meta = txn["metadata"]
-        mac_address = meta.get("mac_address")
-        
-        # Dynamic extraction scan loop through Safaricom nested metadata items list array
-        callback_metadata = stk_callback.get("CallbackMetadata", {}).get("Item", [])
-        mpesa_receipt = "SANDBOX_VALIDATED"
-        customer_phone = meta.get("phone")
-        
-        for item in callback_metadata:
-            if item.get("Name") == "MpesaReceiptNumber":
-                mpesa_receipt = str(item.get("Value"))
-            elif item.get("Name") == "PhoneNumber":
-                customer_phone = str(item.get("Value"))
-        
-        tier_id = txn_type.replace("voucher_", "")
-        tier_query = supabase.table("voucher_tiers").select("*").eq("id", tier_id).execute()
-        if not tier_query.data or len(tier_query.data) == 0:
-            return {"status": "error", "message": "Voucher settings match entry not found."}
-            
-        # Flatten database tier array row layer to clean dictionary mapping references
-        tier = tier_query.data[0]
-        
-        # Update security kyc bindings on user profiles
-        supabase.table("users").update({
-            "phone_number": customer_phone,
-            "device_mac_address": mac_address
-        }).eq("id", user_id).execute()
-        
-        # Map out internet allocation windows safely
-        if int(tier["wifi_duration_hours"]) > 0:
-            new_expiry = datetime.utcnow() + timedelta(hours=int(tier["wifi_duration_hours"]))
-            supabase.table("users").update({"wifi_expiration_time": new_expiry.isoformat()}).eq("id", user_id).execute()
-            background_tasks.add_task(trigger_mikrotik_access_bridge, mac_address, int(tier["wifi_duration_hours"]))
-            
-        # Map out premium voice minute buckets safely
-        if int(tier["voice_minutes_allocated"]) > 0:
-            user_profile_query = supabase.table("users").select("premium_voice_minutes").eq("id", user_id).execute()
-            if user_profile_query.data and len(user_profile_query.data) > 0:
-                user_profile = user_profile_query.data[0]
-                updated_minutes = int(user_profile["premium_voice_minutes"]) + int(tier["voice_minutes_allocated"])
-                supabase.table("users").update({"premium_voice_minutes": updated_minutes}).eq("id", user_id).execute()
-            
-        # Mark tracking rows inside the database transaction logs as successful
-        supabase.table("wallet_transactions").update({
-            "status": "SUCCESS",
-            "metadata": {"mac_address": mac_address, "phone": customer_phone, "receipt": mpesa_receipt}
-        }).eq("mpesa_checkout_id", checkout_id).execute()
-        
-        return {"status": "processed", "message": "KYC verified and allowances allocated successfully."}
-        
-    return {"status": "ignored", "code": result_code}
+    state = body.get("callSessionState", "")
+    caller = body.get("callerNumber", "")
+    digits = str(body.get("dtmfDigits") or body.get("digits") or "").strip()
 
+    # Non-interactive progress updates require no new actions
+    if state in ("Dialing", "Bridged"):
+        return {"actions": []}
+
+    # 1. Terminal state: log call & bill the specific user who answered the bridged leg
+    if state == "Completed":
+        dial_sec = int(body.get("dialDurationInSeconds") or body.get("durationInSeconds") or 0)
+        dialed_user_phone = body.get("dialDestinationNumber", "")
+        recording_url = body.get("recordingUrl")
+        billed_kes = round(dial_sec * 0.05, 2)  # KES 3.00/min billed per second
+
+        if dialed_user_phone:
+            user_res = supabase.table("users").select("*").eq("phone", dialed_user_phone).execute()
+            if user_res.data:
+                user = user_res.data[0]
+                supabase.table("call_logs").insert({
+                    "user_id": user["id"],
+                    "caller_number": caller,
+                    "duration_seconds": dial_sec,
+                    "cost_in_kes": billed_kes if not user["subscription_active"] else 0.00,
+                    "is_recorded": bool(recording_url),
+                    "recording_url": recording_url
+                }).execute()
+
+                if not user["subscription_active"] and billed_kes > 0:
+                    new_bal = max(Decimal("0.00"), Decimal(str(user["wallet_balance"])) - Decimal(str(billed_kes)))
+                    supabase.table("users").update({"wallet_balance": float(new_bal)}).eq("id", user["id"]).execute()
+
+        return {"actions": []}
+
+    # 2. First prompt: no digits entered yet -> ask for the 4-digit user extension
+    if not digits:
+        return {
+            "actions": [
+                {
+                    "getDigits": {
+                        "numDigits": 4,
+                        "timeout": 10,
+                        "finishOnKey": "#",
+                        "nested": [
+                            {
+                                "say": {
+                                    "text": "Karibu NaxNeti. Please enter the four digit extension of the person you are calling. Tafadhali weka namba ya upanuzi.",
+                                    "language": "en-KE"
+                                }
+                            }
+                        ]
+                    }
+                },
+                {
+                    "say": {
+                        "text": "We did not receive an extension. Please try again later. Goodbye.",
+                        "language": "en-KE"
+                    }
+                },
+                {"hangup": {}}
+            ]
+        }
+
+    # 3. Caller entered digits -> look up the matching pilot user
+    user_res = supabase.table("users").select("*").eq("extension", digits).execute()
+    if not user_res.data:
+        return {
+            "actions": [
+                {
+                    "say": {
+                        "text": "That extension was not found. Please check the number and call again. Goodbye.",
+                        "language": "en-KE"
+                    }
+                },
+                {"hangup": {}}
+            ]
+        }
+
+    user = user_res.data[0]
+
+    # 4. Verify active subscription or minimum KES 10.00 balance before connecting
+    if not user["subscription_active"] and Decimal(str(user["wallet_balance"])) < Decimal("10.00"):
+        return {
+            "actions": [
+                {
+                    "say": {
+                        "text": "The subscriber you are calling is temporarily unavailable. Goodbye.",
+                        "language": "en-KE"
+                    }
+                },
+                {"hangup": {}}
+            ]
+        }
+
+    # 5. Connect the caller to that pilot user's phone with recording notice
+    return {
+        "actions": [
+            {
+                "say": {
+                    "text": "Connecting your call now. This call may be recorded for quality assurance.",
+                    "language": "en-KE"
+                }
+            },
+            {
+                "dial": {
+                    "number": user["phone"],
+                    "callerId": SAUTIKIT_NUMBER,
+                    "timeout": 30,
+                    "record": "record-from-answer"
+                }
+            },
+            {
+                "say": {
+                    "text": "The person you are calling did not answer. Please try again later. Goodbye.",
+                    "language": "en-KE"
+                }
+            },
+            {"hangup": {}}
+        ]
+    }
+
+# -------------------------------------------------------------
+# API GROUP C: WIRELESS HARDWARE SDN GATING
+# -------------------------------------------------------------
+@app.post("/api/v1/wifi/authorize")
