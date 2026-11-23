@@ -248,10 +248,7 @@ async def sautikit_voice_callback(request: Request):
         ]
     }
 
-# -------------------------------------------------------------
-# API GROUP C: WIRELESS HARDWARE SDN GATING
-# -------------------------------------------------------------
-@app.post("/api/v1/wifi/authorize")
+
 
 # -------------------------------------------------------------
 # API GROUP C: WIRELESS HARDWARE SDN GATING
