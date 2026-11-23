@@ -1,4 +1,4 @@
-import os
+uimport os
 import requests
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
@@ -252,3 +252,36 @@ async def sautikit_voice_callback(request: Request):
 # API GROUP C: WIRELESS HARDWARE SDN GATING
 # -------------------------------------------------------------
 @app.post("/api/v1/wifi/authorize")
+
+# -------------------------------------------------------------
+# API GROUP C: WIRELESS HARDWARE SDN GATING
+# -------------------------------------------------------------
+@app.post("/api/v1/wifi/authorize")
+def activate_mesh_session(payload: WifiAuthRequest):
+    user_res = supabase.table("users").select("*").eq("id", payload.user_id).execute()
+    if not user_res.data:
+        raise HTTPException(status_code=404, detail="User profile not found")
+
+    user = user_res.data
+    if not user["subscription_active"] and Decimal(str(user["wallet_balance"])) < Decimal("20.00"):
+        raise HTTPException(status_code=400, detail="Insufficient balance for WiFi pass")
+
+    start_time = datetime.now(timezone.utc)
+    end_time = start_time + timedelta(minutes=payload.duration_minutes)
+
+    try:
+        supabase.table("wifi_sessions").insert({
+            "user_id": payload.user_id,
+            "mac_address": payload.device_mac_address,
+            "session_start": start_time.isoformat(),
+            "session_end": end_time.isoformat()
+        }).execute()
+
+        if not user["subscription_active"]:
+            new_bal = Decimal(str(user["wallet_balance"])) - Decimal("20.00")
+            supabase.table("users").update({"wallet_balance": float(new_bal)}).eq("id", payload.user_id).execute()
+
+        return {"status": "connected", "expires_at": end_time.isoformat()}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
