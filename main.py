@@ -251,6 +251,179 @@ def initiate_utility_vend(payload: UtilityVendRequest):
             "status": "PENDING"
         }).execute()
         txn_id = txn_insert.data[0]["id"]
+        util_insert = supabase.table("utility_orders").insert({
+            "user_id": payload.user_id,
+            "transaction_id": txn_id,
+            "utility_type": sku["utility_type"],
+            "target_account": payload.target_account,
+            "amount": float(base_amount),
+            "fulfillment_status": "QUEUED"
+        }).execute()
+        util_order_id = util_insert.data[0]["id"]
+
+        supabase.table("transactions").update({"reference_id": util_order_id}).eq("id", txn_id).execute()
+
+        return {
+            "status": "pending_payment",
+            "message": "M-Pesa STK Push initiated",
+            "transaction_id": txn_id,
+            "utility_order_id": util_order_id,
+            "checkout_request_id": checkout_request_id,
+            "gross_amount": float(gross_amount),
+            "convenience_fee": float(flat_fee)
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/v1/payments/mpesa/callback")
+async def unified_mpesa_callback(request: Request, background_tasks: BackgroundTasks):
+    data = await request.json()
+
+    stk_callback = data.get("Body", {}).get("stkCallback")
+    if stk_callback:
+        checkout_id = stk_callback.get("CheckoutRequestID")
+        result_code = int(stk_callback.get("ResultCode", -1))
+        receipt_no = None
+        for item in stk_callback.get("CallbackMetadata", {}).get("Item", []):
+            if item.get("Name") == "MpesaReceiptNumber":
+                receipt_no = str(item.get("Value"))
+    else:
+        checkout_id = data.get("checkout_request_id") or data.get("checkout_id")
+        result_code = 0 if data.get("status") == "SUCCESS" else int(data.get("ResultCode", -1))
+        receipt_no = data.get("mpesa_receipt_no") or f"RCPT_{secrets.token_hex(4).upper()}"
+
+    if not checkout_id:
+        raise HTTPException(status_code=400, detail="Missing CheckoutRequestID")
+
+    txn_res = supabase.table("transactions").select("*").eq("mpesa_checkout_id", checkout_id).execute()
+    if not txn_res.data:
+        raise HTTPException(status_code=404, detail="Transaction reference not found")
+
+    txn = txn_res.data[0]
+
+    if txn["status"] in ("PAID", "FULFILLED"):
+        return {"status": "duplicate_ignored", "message": "Callback already processed"}
+
+    if result_code != 0:
+        supabase.table("transactions").update({
+            "status": "FAILED",
+            "updated_at": datetime.now(timezone.utc).isoformat()
+        }).eq("id", txn["id"]).execute()
+        return {"status": "failed", "message": "M-Pesa payment cancelled or failed"}
+
+    supabase.table("transactions").update({
+        "status": "PAID",
+        "mpesa_receipt_no": receipt_no,
+        "updated_at": datetime.now(timezone.utc).isoformat()
+    }).eq("id", txn["id"]).execute()
+
+    if txn["module_source"] == "UTILITY" and txn.get("reference_id"):
+        background_tasks.add_task(fulfill_utility_order_worker, txn["reference_id"], txn["id"])
+    elif txn["module_source"] == "COMMERCE" and txn.get("reference_id"):
+        background_tasks.add_task(notify_vendor_paid_order_worker, txn["reference_id"], txn["id"])
+
+    return {"status": "accepted", "message": "Payment confirmed and fulfillment queued"}
+
+
+# -------------------------------------------------------------
+# API GROUP D: SPRINT 2 HYPER-LOCAL COMMERCE (UMOJA / BURUBURU)
+# -------------------------------------------------------------
+@app.post("/v1/orders")
+def create_hyperlocal_order(payload: CreateOrderRequest):
+    if not payload.items:
+        raise HTTPException(status_code=400, detail="Order must contain at least one item")
+
+    idem_key = payload.idempotency_key or f"ORD-{payload.customer_id}-{uuid.uuid4()}"
+
+    existing_txn = supabase.table("transactions").select("*").eq("idempotency_key", idem_key).execute()
+    if existing_txn.data:
+        txn = existing_txn.data[0]
+        return {
+            "status": "duplicate_ignored",
+            "order_id": txn["reference_id"],
+            "transaction_id": txn["id"],
+            "checkout_request_id": txn["mpesa_checkout_id"],
+            "total_amount": txn["gross_amount"]
+        }
+
+    vendor_res = supabase.table("vendors").select("*").eq("id", payload.vendor_id).execute()
+    if not vendor_res.data:
+        raise HTTPException(status_code=404, detail="Vendor not found")
+
+    vendor = vendor_res.data[0]
+    if not vendor["is_open"]:
+        raise HTTPException(status_code=400, detail="This neighborhood vendor is currently closed")
+
+    items_subtotal = sum(Decimal(str(item.price)) * Decimal(str(item.qty)) for item in payload.items)
+    delivery_fee = (
+        Decimal("0.00")
+        if payload.fulfillment_mode == "SELF_PICKUP"
+        else Decimal(str(vendor["delivery_fee_flat"]))
+    )
+    total_amount = round(items_subtotal + delivery_fee, 2)
+    checkout_request_id = f"ws_CO_{int(datetime.now(timezone.utc).timestamp())}_{secrets.token_hex(4)}"
+
+    try:
+        serialized_items = [item.model_dump() for item in payload.items]
+        order_insert = supabase.table("orders").insert({
+            "customer_id": payload.customer_id,
+            "vendor_id": payload.vendor_id,
+            "items": serialized_items,
+            "delivery_address": payload.delivery_address,
+            "fulfillment_mode": payload.fulfillment_mode,
+            "delivery_fee": float(delivery_fee),
+            "total_amount": float(total_amount),
+            "status": "PENDING_PAYMENT"
+        }).execute()
+        order_id = order_insert.data[0]["id"]
+
+        txn_insert = supabase.table("transactions").insert({
+            "idempotency_key": idem_key,
+            "user_id": payload.customer_id,
+            "module_source": "COMMERCE",
+            "reference_id": order_id,
+            "mpesa_checkout_id": checkout_request_id,
+            "gross_amount": float(total_amount),
+            "platform_fee": float(delivery_fee),
+            "wholesale_cost": float(items_subtotal),
+            "status": "PENDING"
+        }).execute()
+        txn_id = txn_insert.data[0]["id"]
+
+        return {
+            "status": "pending_payment",
+            "message": "Order created and M-Pesa STK Push initiated",
+            "order_id": order_id,
+            "transaction_id": txn_id,
+            "checkout_request_id": checkout_request_id,
+            "items_subtotal": float(items_subtotal),
+            "delivery_fee": float(delivery_fee),
+            "total_amount": float(total_amount)
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.patch("/v1/orders/{order_id}/status")
+def update_order_status(order_id: str, payload: UpdateOrderStatusRequest):
+    allowed_states = ("ACCEPTED", "DISPATCHED_BODA", "DELIVERED", "CANCELLED")
+    if payload.status not in allowed_states:
+        raise HTTPException(status_code=400, detail=f"Invalid status. Must be one of {allowed_states}")
+
+    order_res = supabase.table("orders").select("*").eq("id", order_id).execute()
+    if not order_res.data:
+        raise HTTPException(status_code=404, detail="Order not found")
+
+    update_fields: Dict[str, Any] = {
+        "status": payload.status,
+        "updated_at": datetime.now(timezone.utc).isoformat()
+    }
+    if payload.rider_id:
+        update_fields["rider_id"] = payload.rider_id
+
+    supabase.table("orders").update(update_fields).eq("id", order_id).execute()
+    return {"status": "updated", "order_id": order_id, "new_state": payload.status}
 
 # -------------------------------------------------------------
 # LEGACY WALLET TOP-UP ENDPOINTS (PRESERVED FOR EXISTING APP)
