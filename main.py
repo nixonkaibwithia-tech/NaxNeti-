@@ -3,6 +3,11 @@ import time
 import uuid
 import secrets
 import requests
+import hmac
+import hashlib
+import base64
+import json
+
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Optional, List, Dict, Any
@@ -74,6 +79,33 @@ class CreateOrderRequest(BaseModel):
 class UpdateOrderStatusRequest(BaseModel):
     status: str   # "ACCEPTED", "DISPATCHED_BODA", "DELIVERED", "CANCELLED"
     rider_id: Optional[str] = None
+BRIDGE_JWT_SECRET = os.getenv("BRIDGE_JWT_SECRET") or SUPABASE_KEY or "naxneti-bridge-secret"
+GAME_HMAC_SECRET = os.getenv("GAME_HMAC_SECRET") or SUPABASE_KEY or "naxneti-game-secret"
+
+class BridgeTokenRequest(BaseModel):
+    user_id: str
+    app_slug: str
+
+class GameScoreRequest(BaseModel):
+    user_id: str
+    score: int
+    session_hash: str
+    signature: str   # HMAC-SHA256 hex digest of "{user_id}:{slug}:{score}:{session_hash}"
+
+class CreateEstatePostRequest(BaseModel):
+    author_id: str
+    estate_id: str
+    zone_code: Optional[str] = None
+    tag: str         # 'ALERT', 'MARKETPLACE', 'LOST_FOUND', 'PROMO', 'GENERAL'
+    content: str
+    media_urls: List[str] = []
+
+class CreateChatMessageRequest(BaseModel):
+    room_id: str
+    sender_id: str
+    msg_type: str = "TEXT"   # 'TEXT', 'IMAGE', 'ACTION_CARD'
+    body: Optional[str] = None
+    action_payload: Optional[Dict[str, Any]] = None
 
 # -------------------------------------------------------------
 # BACKGROUND WORKERS: UTILITY VENDING & VENDOR SMS ALERTS
@@ -424,6 +456,164 @@ def update_order_status(order_id: str, payload: UpdateOrderStatusRequest):
 
     supabase.table("orders").update(update_fields).eq("id", order_id).execute()
     return {"status": "updated", "order_id": order_id, "new_state": payload.status}
+# -------------------------------------------------------------
+# API GROUP E: SPRINT 3 & 4 MINI-APPS, GAMING & ESTATE PULSE
+# -------------------------------------------------------------
+def _mint_scoped_jwt(payload: Dict[str, Any], secret: str) -> str:
+    header = {"alg": "HS256", "typ": "JWT"}
+    b64_h = base64.urlsafe_b64encode(json.dumps(header, separators=(",", ":")).encode()).rstrip(b"=").decode()
+    b64_p = base64.urlsafe_b64encode(json.dumps(payload, separators=(",", ":")).encode()).rstrip(b"=").decode()
+    signing_input = f"{b64_h}.{b64_p}".encode()
+    sig = base64.urlsafe_b64encode(hmac.new(secret.encode(), signing_input, hashlib.sha256).digest()).rstrip(b"=").decode()
+    return f"{b64_h}.{b64_p}.{sig}"
+
+
+@app.post("/v1/bridge/token")
+def issue_miniapp_bridge_token(payload: BridgeTokenRequest):
+    """
+    Sprint 3 (Module 2): Issues a 15-minute scoped JWT for sandboxed WebView Mini-Apps
+    after verifying the app_slug is active in the mini_apps registry.
+    """
+    app_res = supabase.table("mini_apps").select("*").eq("slug", payload.app_slug).eq("is_active", True).execute()
+    if not app_res.data:
+        raise HTTPException(status_code=404, detail="Mini-App not found or inactive")
+
+    user_res = supabase.table("users").select("id, phone, display_name, estate_id, landmark_address").eq("id", payload.user_id).execute()
+    if not user_res.data:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    mini_app = app_res.data[0]
+    user = user_res.data[0]
+    now_ts = int(datetime.now(timezone.utc).timestamp())
+
+    claims = {
+        "sub": user["id"],
+        "phone": user["phone"],
+        "display_name": user.get("display_name") or "NaxNeti Resident",
+        "estate_id": user.get("estate_id"),
+        "app_slug": mini_app["slug"],
+        "permissions": mini_app.get("permissions", ["AUTH"]),
+        "iat": now_ts,
+        "exp": now_ts + 900
+    }
+    scoped_token = _mint_scoped_jwt(claims, BRIDGE_JWT_SECRET)
+    return {
+        "status": "ok",
+        "app_slug": mini_app["slug"],
+        "entry_url": mini_app["entry_url"],
+        "permissions": claims["permissions"],
+        "bridge_token": scoped_token,
+        "expires_in": 900
+    }
+
+
+@app.post("/v1/games/{slug}/score")
+def submit_game_score(slug: str, payload: GameScoreRequest):
+    """
+    Sprint 3 (Module 4): Validates HMAC-SHA256 score signature to block spoofing,
+    records score for the current ISO tournament week, and returns estate top 10.
+    """
+    expected_msg = f"{payload.user_id}:{slug}:{payload.score}:{payload.session_hash}".encode()
+    expected_sig = hmac.new(GAME_HMAC_SECRET.encode(), expected_msg, hashlib.sha256).hexdigest()
+
+    if not hmac.compare_digest(expected_sig, payload.signature.lower()):
+        raise HTTPException(status_code=403, detail="Invalid score signature")
+
+    app_res = supabase.table("mini_apps").select("id").eq("slug", slug).eq("app_type", "GAME").eq("is_active", True).execute()
+    if not app_res.data:
+        raise HTTPException(status_code=404, detail="Game not found or inactive")
+
+    user_res = supabase.table("users").select("estate_id").eq("id", payload.user_id).execute()
+    if not user_res.data or not user_res.data[0].get("estate_id"):
+        raise HTTPException(status_code=400, detail="User must select an estate before competing")
+
+    game_id = app_res.data[0]["id"]
+    estate_id = user_res.data[0]["estate_id"]
+    iso_year, iso_week, _ = datetime.now(timezone.utc).isocalendar()
+    tournament_week = f"{iso_year}-W{iso_week:02d}"
+
+    supabase.table("game_scores").insert({
+        "mini_app_id": game_id,
+        "user_id": payload.user_id,
+        "estate_id": estate_id,
+        "score": payload.score,
+        "tournament_week": tournament_week
+    }).execute()
+
+    top_res = (
+        supabase.table("game_scores")
+        .select("user_id, score, created_at")
+        .eq("mini_app_id", game_id)
+        .eq("estate_id", estate_id)
+        .eq("tournament_week", tournament_week)
+        .order("score", desc=True)
+        .limit(10)
+        .execute()
+    )
+
+    return {
+        "status": "recorded",
+        "tournament_week": tournament_week,
+        "estate_leaderboard": top_res.data
+    }
+
+
+@app.get("/v1/feed/estate")
+def get_estate_feed(estate_id: str, tag: Optional[str] = None, limit: int = 30):
+    """
+    Sprint 4 (Module 5): Fetches geofenced Estate Pulse community posts.
+    """
+    query = (
+        supabase.table("estate_posts")
+        .select("*")
+        .eq("estate_id", estate_id)
+        .order("created_at", desc=True)
+        .limit(min(limit, 50))
+    )
+    if tag:
+        query = query.eq("tag", tag.upper())
+
+    res = query.execute()
+    return {"status": "ok", "estate_id": estate_id, "posts": res.data}
+
+
+@app.post("/v1/feed/estate")
+def create_estate_post(payload: CreateEstatePostRequest):
+    allowed_tags = ("ALERT", "MARKETPLACE", "LOST_FOUND", "PROMO", "GENERAL")
+    clean_tag = payload.tag.upper()
+    if clean_tag not in allowed_tags:
+        raise HTTPException(status_code=400, detail=f"Tag must be one of {allowed_tags}")
+
+    res = supabase.table("estate_posts").insert({
+        "author_id": payload.author_id,
+        "estate_id": payload.estate_id,
+        "zone_code": payload.zone_code,
+        "tag": clean_tag,
+        "content": payload.content.strip(),
+        "media_urls": payload.media_urls
+    }).execute()
+
+    return {"status": "created", "post": res.data[0]}
+
+
+@app.post("/v1/chat/messages")
+def send_chat_message(payload: CreateChatMessageRequest):
+    """
+    Sprint 4 (Module 5): Persists text, compressed image URLs, or interactive ACTION_CARDs
+    (PAYMENT_SPLIT, ORDER_THREAD, MINI_APP_SHARE) for offline-first sync.
+    """
+    if payload.msg_type not in ("TEXT", "IMAGE", "ACTION_CARD"):
+        raise HTTPException(status_code=400, detail="Invalid msg_type")
+
+    res = supabase.table("chat_messages").insert({
+        "room_id": payload.room_id,
+        "sender_id": payload.sender_id,
+        "msg_type": payload.msg_type,
+        "body": payload.body,
+        "action_payload": payload.action_payload
+    }).execute()
+
+    return {"status": "sent", "message": res.data[0]}
 
 # -------------------------------------------------------------
 # LEGACY WALLET TOP-UP ENDPOINTS (PRESERVED FOR EXISTING APP)
